@@ -1,0 +1,119 @@
+name: CI 109062362
+
+on:
+  push:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-109062362-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gates:
+    name: Typecheck, format, and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Prettier check
+        run: npm run format:check
+
+      - name: Run tests with JUnit report
+        id: tests
+        run: |
+          mkdir -p reports
+          npm test -- --reporter=default --reporter=junit --outputFile.junit=reports/vitest-junit.xml
+
+      - name: Add test results to job summary
+        if: ${{ always() && steps.tests.conclusion != 'skipped' }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const reportPath = 'reports/vitest-junit.xml';
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+
+          if (!summaryPath) {
+            console.log('GITHUB_STEP_SUMMARY is not set; skipping summary output.');
+            process.exit(0);
+          }
+
+          const append = (content) => fs.appendFileSync(summaryPath, content);
+          append('## Vitest Test Results\n\n');
+
+          if (!fs.existsSync(reportPath)) {
+            append('JUnit report was not generated.\n');
+            process.exit(0);
+          }
+
+          const xml = fs.readFileSync(reportPath, 'utf8');
+          const attr = (source, name) => {
+            const match = source.match(new RegExp(`\\b${name}="([^"]*)"`, 'i'));
+            return match ? match[1] : '0';
+          };
+          const escapeMarkdown = (value) => String(value).replace(/\|/g, '\\|').replace(/\s+/g, ' ');
+          const totalsSource = xml.match(/<testsuites\b[^>]*>/)?.[0] ?? xml.match(/<testsuite\b[^>]*>/)?.[0] ?? '';
+
+          append('| Tests | Failures | Errors | Skipped | Time (s) |\n');
+          append('| ---: | ---: | ---: | ---: | ---: |\n');
+          append(
+            `| ${attr(totalsSource, 'tests')} | ${attr(totalsSource, 'failures')} | ${attr(totalsSource, 'errors')} | ${attr(totalsSource, 'skipped')} | ${attr(totalsSource, 'time')} |\n\n`
+          );
+
+          append('| Test case | Status | Time (s) |\n');
+          append('| --- | --- | ---: |\n');
+
+          const testcasePattern = /<testcase\b([^>]*)>([\s\S]*?)<\/testcase>|<testcase\b([^>]*)\/>/g;
+          const rows = [];
+          for (const match of xml.matchAll(testcasePattern)) {
+            const attrs = match[1] ?? match[3] ?? '';
+            const body = match[2] ?? '';
+            const className = attr(attrs, 'classname');
+            const testName = attr(attrs, 'name');
+            const status = body.includes('<failure')
+              ? 'failed'
+              : body.includes('<error')
+                ? 'error'
+                : body.includes('<skipped')
+                  ? 'skipped'
+                  : 'passed';
+            rows.push({
+              name: className && className !== '0' ? `${className} - ${testName}` : testName,
+              status,
+              time: attr(attrs, 'time')
+            });
+          }
+
+          for (const row of rows.slice(0, 50)) {
+            append(`| ${escapeMarkdown(row.name)} | ${row.status} | ${row.time} |\n`);
+          }
+
+          if (rows.length > 50) {
+            append(`\nShowing 50 of ${rows.length} test cases. Download the JUnit artifact for the full report.\n`);
+          }
+          NODE
+
+      - name: Upload JUnit test report
+        if: ${{ always() && steps.tests.conclusion != 'skipped' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: vitest-junit-report
+          path: reports/vitest-junit.xml
+          if-no-files-found: error
